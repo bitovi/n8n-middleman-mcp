@@ -28,7 +28,7 @@ const ALL_WORKFLOWS = {
 
 // ── 2. Per-user permissions ────────────────────────────────────────────────
 const USER_PERMISSIONS = {
-  "nikita.email1.com": ["get_weather", "create_task"],
+  "nikita.email1@gmail.com": ["get_weather", "create_task"],
   "nikita.email2@gmail.com": ["email_draft"],
 };
 
