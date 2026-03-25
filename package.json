@@ -1,10 +1,12 @@
 {
   "name": "middleman-mcp",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "MCP connector that authenticates with Microsoft and forwards auth context to n8n webhooks",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "echo \"No tests configured\"",
+    "test:n8n-mcp": "node scripts/test-n8n-mcp.js"
   },
   "keywords": [],
   "author": "",

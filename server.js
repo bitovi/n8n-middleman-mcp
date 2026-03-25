@@ -1,73 +1,759 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import fetch from "node-fetch";
-import https from "https";
+import fs from 'node:fs';
+import http from 'node:http';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import fetch from 'node-fetch';
+import * as z from 'zod/v4';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-const agent = new https.Agent({ rejectUnauthorized: false });
-const N8N_BASE = "https://localhost:5678/webhook";
-
-// ── 1. All possible workflows ──────────────────────────────────────────────
-const ALL_WORKFLOWS = {
-  get_weather: {
-    description: "Gets current weather for a city",
-    webhookPath: "get-weather",
-    inputSchema: z.object({ city: z.string() }),
-  },
-  create_task: {
-    description: "Creates a task in the task manager",
-    webhookPath: "create-task",
-    inputSchema: z.object({ title: z.string(), due_date: z.string().optional() }),
-  },
-  email_draft: {
-    description: "Drafts an email given a recipient and message body",
-    webhookPath: "email-draft",
-    inputSchema: z.object({ to: z.string(), body: z.string() }),
-  },
-};
-
-// ── 2. Per-user permissions ────────────────────────────────────────────────
-const USER_PERMISSIONS = {
-  "nikita.email1@gmail.com": ["get_weather", "create_task"],
-  "nikita.email2@gmail.com": ["email_draft"],
-};
-
-// ── 3. Read current user from env variable ─────────────────────────────────
-const currentUser = process.env.MCP_USER;
-
-if (!currentUser) {
-  console.error("ERROR: MCP_USER environment variable is not set.");
-  process.exit(1);
+function loadDotEnv(path = '.env') {
+  if (!fs.existsSync(path)) return;
+  const text = fs.readFileSync(path, 'utf8');
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const rawValue = trimmed.slice(eq + 1).trim();
+    const value = rawValue.replace(/^['"]|['"]$/g, '');
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
 }
 
-const allowedTools = USER_PERMISSIONS[currentUser];
+loadDotEnv();
 
-if (!allowedTools) {
-  console.error(`ERROR: No permissions found for user: ${currentUser}`);
-  process.exit(1);
+const REQUIRED_ENV = ['MS_CLIENT_ID'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
 }
 
-console.error(`Middleman MCP running as: ${currentUser}`);
-console.error(`Allowed tools: ${allowedTools.join(", ")}`);
+const MCP_USER = process.env.MCP_USER || 'default-user';
+const MS_TENANT_ID = process.env.MS_TENANT_ID || 'common';
+const MS_CLIENT_ID = process.env.MS_CLIENT_ID;
+const MS_SCOPES = process.env.MS_SCOPES || 'openid profile offline_access User.Read';
+const N8N_DEFAULT_WEBHOOK_URL = process.env.N8N_DEFAULT_WEBHOOK_URL;
+const MCP_PORT = Number(process.env.MCP_PORT || 8787);
+const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL;
 
-// ── 4. Register only allowed tools ────────────────────────────────────────
-const server = new McpServer({ name: "middleman-mcp", version: "1.0.0" });
+const DEVICE_CODE_URL = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/devicecode`;
+const TOKEN_URL = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`;
+const AUTHORIZE_URL = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/authorize`;
 
-for (const toolName of allowedTools) {
-  const config = ALL_WORKFLOWS[toolName];
-  server.tool(toolName, config.description, config.inputSchema.shape, async (params) => {
-    const response = await fetch(`${N8N_BASE}/${config.webhookPath}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-      agent,
-    });
-    const result = await response.json();
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+/** @type {Map<string, any>} */
+const tokenStore = new Map();
+/** @type {Map<string, any>} */
+const pendingDeviceFlow = new Map();
+/** @type {Map<string, any>} */
+const pendingClaudeAuth = new Map();
+/** @type {Map<string, any>} */
+const issuedAuthCodes = new Map();
+/** @type {Map<string, any>} */
+const issuedRefreshTokens = new Map();
+
+const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+function base64UrlEncode(buf) {
+  return Buffer.from(buf)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function randomToken(size = 32) {
+  return base64UrlEncode(randomBytes(size));
+}
+
+function sha256Base64Url(input) {
+  return base64UrlEncode(createHash('sha256').update(input).digest());
+}
+
+function parseBearerToken(req) {
+  const auth = req.headers.authorization;
+  if (!auth || typeof auth !== 'string') return null;
+  const [scheme, token] = auth.split(' ');
+  if (!scheme || !token || scheme.toLowerCase() !== 'bearer') return null;
+  return token;
+}
+
+function parseBasicAuthClient(req) {
+  const auth = req.headers.authorization;
+  if (!auth || typeof auth !== 'string') return null;
+  const [scheme, encoded] = auth.split(' ');
+  if (!scheme || !encoded || scheme.toLowerCase() !== 'basic') return null;
+  try {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx < 0) return null;
+    const clientId = decoded.slice(0, idx);
+    const clientSecret = decoded.slice(idx + 1);
+    return { clientId, clientSecret };
+  } catch {
+    return null;
+  }
+}
+
+function buildPublicUrl(pathname) {
+  if (!MCP_PUBLIC_URL) return null;
+  return new URL(pathname, MCP_PUBLIC_URL).toString();
+}
+
+function cleanupExpiredAuthArtifacts() {
+  const now = nowMs();
+  for (const [code, data] of issuedAuthCodes.entries()) {
+    if (data.expires_at <= now || data.used) {
+      issuedAuthCodes.delete(code);
+    }
+  }
+  for (const [token, data] of issuedRefreshTokens.entries()) {
+    if (data.expires_at && data.expires_at <= now) {
+      issuedRefreshTokens.delete(token);
+    }
+  }
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function hasValidAccessToken(tokens) {
+  if (!tokens?.access_token || !tokens?.expires_at) return false;
+  return tokens.expires_at - 60_000 > nowMs();
+}
+
+async function refreshAccessToken(userId) {
+  const existing = tokenStore.get(userId);
+  if (!existing?.refresh_token) return null;
+
+  const body = new URLSearchParams({
+    client_id: MS_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: existing.refresh_token,
+    scope: MS_SCOPES
+  });
+
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    return null;
+  }
+
+  const merged = {
+    ...existing,
+    ...json,
+    refresh_token: json.refresh_token || existing.refresh_token,
+    expires_at: nowMs() + (Number(json.expires_in || 3600) * 1000)
+  };
+
+  tokenStore.set(userId, merged);
+  return merged;
+}
+
+async function ensureUsableToken(userId) {
+  const existing = tokenStore.get(userId);
+  if (hasValidAccessToken(existing)) return existing;
+  return refreshAccessToken(userId);
+}
+
+function createServer() {
+  const server = new McpServer(
+    {
+      name: 'n8n-middleman-ms-connector',
+      version: '2.1.0'
+    },
+    {
+      capabilities: {
+        tools: { listChanged: true },
+        logging: {}
+      }
+    }
+  );
+
+  server.registerTool(
+  'call_n8n_workflow',
+  {
+    description:
+      'Call an n8n webhook/workflow endpoint and automatically include the Microsoft access token in headers.',
+    inputSchema: {
+      url: z.string().optional().describe('Full n8n webhook URL. Falls back to N8N_DEFAULT_WEBHOOK_URL env.'),
+      method: z.string().optional().describe('HTTP method. Default POST.'),
+      body: z.any().optional().describe('Request body JSON.'),
+      headers: z.record(z.string(), z.string()).optional().describe('Additional headers to send.')
+    }
+  },
+  async ({ url, method, body, headers }) => {
+    const targetUrl = url || N8N_DEFAULT_WEBHOOK_URL;
+    if (!targetUrl) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: 'No workflow URL provided. Pass url or set N8N_DEFAULT_WEBHOOK_URL.'
+          }
+        ]
+      };
+    }
+
+    const tokens = await ensureUsableToken(MCP_USER);
+    if (!tokens?.access_token) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: 'No Microsoft access token available. Reconnect this MCP server via Claude OAuth and try again.'
+          }
+        ]
+      };
+    }
+
+    const requestHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokens.access_token}`,
+      'x-ms-access-token': tokens.access_token,
+      'x-ms-user': MCP_USER,
+      ...(headers || {})
     };
+
+    const response = await fetch(targetUrl, {
+      method: (method || 'POST').toUpperCase(),
+      headers: requestHeaders,
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+
+    const text = await response.text();
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `n8n call completed.\n` +
+            `Status: ${response.status} ${response.statusText}\n` +
+            `URL: ${targetUrl}\n\n` +
+            `${text}`
+        }
+      ]
+    };
+  }
+  );
+
+  return server;
+}
+
+const sessions = new Map();
+
+function collectBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 10 * 1024 * 1024) {
+        reject(new Error('Request body too large'));
+      }
+    });
+    req.on('end', () => {
+      if (!raw) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
   });
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+function collectRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 1024 * 1024) {
+        reject(new Error('Request body too large'));
+      }
+    });
+    req.on('end', () => resolve(raw));
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, last-event-id');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.end(body);
+}
+
+function sendText(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.end(payload);
+}
+
+function sendRedirect(res, location) {
+  res.statusCode = 302;
+  res.setHeader('Location', location);
+  res.end();
+}
+
+function logAuthEvent(event, details = {}) {
+  const safeDetails = { ...details };
+  if (safeDetails.code) safeDetails.code = '[redacted]';
+  if (safeDetails.code_verifier) safeDetails.code_verifier = '[redacted]';
+  if (safeDetails.access_token) safeDetails.access_token = '[redacted]';
+  if (safeDetails.refresh_token) safeDetails.refresh_token = '[redacted]';
+  console.log(`[oauth] ${event}`, safeDetails);
+}
+
+function logRequestEvent(req, pathname, extra = {}) {
+  console.log('[http]', {
+    method: req.method,
+    pathname,
+    hasAuthorization: typeof req.headers.authorization === 'string',
+    hasSessionId: typeof req.headers['mcp-session-id'] === 'string',
+    ...extra
+  });
+}
+
+function isMcpEndpointPath(pathname) {
+  return pathname === '/mcp' || pathname === '/';
+}
+
+const httpServer = http.createServer(async (req, res) => {
+  cleanupExpiredAuthArtifacts();
+
+  const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const pathname = requestUrl.pathname;
+  logRequestEvent(req, pathname);
+
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, last-event-id');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.end();
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/.well-known/oauth-authorization-server') {
+    if (!MCP_PUBLIC_URL) {
+      sendJson(res, 500, { error: 'MCP_PUBLIC_URL must be configured for OAuth discovery.' });
+      return;
+    }
+
+    sendJson(res, 200, {
+      issuer: MCP_PUBLIC_URL,
+      authorization_endpoint: buildPublicUrl('/authorize'),
+      token_endpoint: buildPublicUrl('/token'),
+      response_types_supported: ['code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+      code_challenge_methods_supported: ['S256'],
+      token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      scopes_supported: ['claudeai']
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && (pathname === '/.well-known/oauth-protected-resource' || pathname === '/.well-known/oauth-protected-resource/mcp')) {
+    if (!MCP_PUBLIC_URL) {
+      sendJson(res, 500, { error: 'MCP_PUBLIC_URL must be configured for OAuth discovery.' });
+      return;
+    }
+
+    sendJson(res, 200, {
+      resource: buildPublicUrl('/mcp'),
+      authorization_servers: [MCP_PUBLIC_URL],
+      scopes_supported: ['claudeai'],
+      bearer_methods_supported: ['header']
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/authorize') {
+    if (!MCP_PUBLIC_URL) {
+      sendText(res, 500, 'MCP_PUBLIC_URL must be set to your public ngrok URL.');
+      return;
+    }
+
+    const responseType = requestUrl.searchParams.get('response_type');
+    const clientId = requestUrl.searchParams.get('client_id');
+    const redirectUri = requestUrl.searchParams.get('redirect_uri');
+    const state = requestUrl.searchParams.get('state');
+    const scope = requestUrl.searchParams.get('scope') || 'claudeai';
+    const codeChallenge = requestUrl.searchParams.get('code_challenge');
+    const codeChallengeMethod = requestUrl.searchParams.get('code_challenge_method') || 'S256';
+
+    if (!responseType || responseType !== 'code' || !clientId || !redirectUri || !state || !codeChallenge) {
+      logAuthEvent('authorize.invalid_request', { responseType, clientId, redirectUri, statePresent: !!state, hasCodeChallenge: !!codeChallenge });
+      sendText(res, 400, 'Invalid authorize request. Missing required OAuth parameters.');
+      return;
+    }
+
+    if (codeChallengeMethod !== 'S256') {
+      logAuthEvent('authorize.unsupported_challenge_method', { codeChallengeMethod });
+      sendText(res, 400, 'Unsupported code_challenge_method. Only S256 is supported.');
+      return;
+    }
+
+    const localState = randomToken(24);
+    pendingClaudeAuth.set(localState, {
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state,
+      scope,
+      code_challenge: codeChallenge,
+      code_challenge_method: codeChallengeMethod,
+      created_at: nowMs()
+    });
+
+    logAuthEvent('authorize.accepted', {
+      clientId,
+      redirectUri,
+      scope,
+      codeChallengeMethod
+    });
+
+    const msRedirectUri = buildPublicUrl('/oauth/callback');
+    const authUrl = new URL(AUTHORIZE_URL);
+    authUrl.searchParams.set('client_id', MS_CLIENT_ID);
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('redirect_uri', msRedirectUri);
+    authUrl.searchParams.set('response_mode', 'query');
+    authUrl.searchParams.set('scope', MS_SCOPES);
+    authUrl.searchParams.set('state', localState);
+
+    sendRedirect(res, authUrl.toString());
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/oauth/callback') {
+    if (!MCP_PUBLIC_URL) {
+      sendText(res, 500, 'MCP_PUBLIC_URL must be configured.');
+      return;
+    }
+
+    const code = requestUrl.searchParams.get('code');
+    const state = requestUrl.searchParams.get('state');
+    const error = requestUrl.searchParams.get('error');
+    const errorDescription = requestUrl.searchParams.get('error_description');
+
+    if (error) {
+      logAuthEvent('oauth_callback.microsoft_error', { error, errorDescription });
+      sendText(res, 400, `Microsoft authorization failed: ${error} ${errorDescription || ''}`.trim());
+      return;
+    }
+
+    if (!code || !state) {
+      logAuthEvent('oauth_callback.missing_code_or_state', { hasCode: !!code, hasState: !!state });
+      sendText(res, 400, 'Missing code or state from Microsoft callback.');
+      return;
+    }
+
+    const pending = pendingClaudeAuth.get(state);
+    if (!pending) {
+      logAuthEvent('oauth_callback.invalid_state');
+      sendText(res, 400, 'Authorization session expired or invalid state.');
+      return;
+    }
+
+    pendingClaudeAuth.delete(state);
+
+    const msRedirectUri = buildPublicUrl('/oauth/callback');
+    const tokenBody = new URLSearchParams({
+      client_id: MS_CLIENT_ID,
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: msRedirectUri,
+      scope: MS_SCOPES
+    });
+
+    if (process.env.MS_CLIENT_SECRET) {
+      tokenBody.set('client_secret', process.env.MS_CLIENT_SECRET);
+    }
+
+    const tokenRes = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: tokenBody
+    });
+    const tokenJson = await tokenRes.json();
+
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      logAuthEvent('oauth_callback.microsoft_token_exchange_failed', {
+        status: tokenRes.status,
+        error: tokenJson?.error,
+        error_description: tokenJson?.error_description
+      });
+      sendText(res, 400, `Microsoft token exchange failed: ${JSON.stringify(tokenJson)}`);
+      return;
+    }
+
+    const msTokens = {
+      ...tokenJson,
+      expires_at: nowMs() + Number(tokenJson.expires_in || 3600) * 1000
+    };
+
+    tokenStore.set(MCP_USER, msTokens);
+
+    const claudeAuthCode = randomToken(24);
+    const mcpAccessToken = randomToken(32);
+    const refreshToken = randomToken(32);
+
+    issuedAuthCodes.set(claudeAuthCode, {
+      client_id: pending.client_id,
+      redirect_uri: pending.redirect_uri,
+      scope: pending.scope,
+      code_challenge: pending.code_challenge,
+      code_challenge_method: pending.code_challenge_method,
+      mcp_access_token: mcpAccessToken,
+      refresh_token: refreshToken,
+      expires_at: nowMs() + AUTH_CODE_TTL_MS,
+      used: false
+    });
+
+    issuedRefreshTokens.set(refreshToken, {
+      client_id: pending.client_id,
+      scope: pending.scope,
+      mcp_access_token: mcpAccessToken,
+      expires_at: nowMs() + 30 * 24 * 60 * 60 * 1000
+    });
+
+    const callbackUrl = new URL(pending.redirect_uri);
+    callbackUrl.searchParams.set('code', claudeAuthCode);
+    callbackUrl.searchParams.set('state', pending.state);
+
+    logAuthEvent('oauth_callback.redirecting_to_claude', {
+      clientId: pending.client_id,
+      redirectUri: pending.redirect_uri,
+      scope: pending.scope
+    });
+
+    sendRedirect(res, callbackUrl.toString());
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/token') {
+    const rawBody = await collectRawBody(req);
+    const params = new URLSearchParams(rawBody);
+    const grantType = params.get('grant_type');
+    const basicClient = parseBasicAuthClient(req);
+    const clientId = params.get('client_id') || basicClient?.clientId || null;
+
+    if (!grantType) {
+      sendJson(res, 400, { error: 'invalid_request', error_description: 'grant_type is required' });
+      return;
+    }
+
+    if (grantType === 'authorization_code') {
+      const code = params.get('code');
+      const redirectUri = params.get('redirect_uri');
+      const codeVerifier = params.get('code_verifier');
+
+      const stored = code ? issuedAuthCodes.get(code) : null;
+      if (!stored || stored.used || stored.expires_at <= nowMs()) {
+        logAuthEvent('token.invalid_or_expired_code', {
+          hasCode: !!code,
+          found: !!stored,
+          used: stored?.used,
+          expired: stored ? stored.expires_at <= nowMs() : undefined
+        });
+        sendJson(res, 400, { error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
+        return;
+      }
+
+      if (!codeVerifier || sha256Base64Url(codeVerifier) !== stored.code_challenge) {
+        logAuthEvent('token.pkce_verification_failed', {
+          clientId,
+          redirectUri,
+          hasCodeVerifier: !!codeVerifier
+        });
+        sendJson(res, 400, { error: 'invalid_grant', error_description: 'PKCE verification failed' });
+        return;
+      }
+
+      stored.used = true;
+
+      logAuthEvent('token.authorization_code_exchanged', {
+        clientId,
+        redirectUri,
+        scope: stored.scope
+      });
+
+      sendJson(res, 200, {
+        access_token: stored.mcp_access_token,
+        token_type: 'bearer',
+        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+        refresh_token: stored.refresh_token,
+        scope: stored.scope
+      });
+      return;
+    }
+
+    if (grantType === 'refresh_token') {
+      const refreshToken = params.get('refresh_token');
+      const stored = refreshToken ? issuedRefreshTokens.get(refreshToken) : null;
+
+      if (!stored || stored.expires_at <= nowMs()) {
+        logAuthEvent('token.invalid_or_expired_refresh_token', {
+          found: !!stored,
+          expired: stored ? stored.expires_at <= nowMs() : undefined
+        });
+        sendJson(res, 400, { error: 'invalid_grant', error_description: 'Invalid or expired refresh token' });
+        return;
+      }
+
+      const nextAccessToken = randomToken(32);
+      stored.mcp_access_token = nextAccessToken;
+
+      logAuthEvent('token.refresh_token_exchanged', {
+        clientId,
+        scope: stored.scope
+      });
+
+      sendJson(res, 200, {
+        access_token: nextAccessToken,
+        token_type: 'bearer',
+        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+        refresh_token: refreshToken,
+        scope: stored.scope
+      });
+      return;
+    }
+
+    sendJson(res, 400, { error: 'unsupported_grant_type' });
+    return;
+  }
+
+  if (!isMcpEndpointPath(pathname)) {
+    sendJson(res, 404, { error: 'Not found' });
+    return;
+  }
+
+  const bearerToken = parseBearerToken(req);
+  if (!bearerToken) {
+    const authServerMetadata = buildPublicUrl('/.well-known/oauth-authorization-server');
+    const resourceMetadata = buildPublicUrl('/.well-known/oauth-protected-resource/mcp');
+    if (authServerMetadata && resourceMetadata) {
+      logAuthEvent('mcp.missing_bearer_token', {
+        hasAuthorizationHeader: typeof req.headers.authorization === 'string',
+        method: req.method
+      });
+      res.statusCode = 401;
+      res.setHeader('WWW-Authenticate', `Bearer realm="mcp", authorization_uri="${buildPublicUrl('/authorize')}", token_uri="${buildPublicUrl('/token')}", resource_metadata="${resourceMetadata}", authorization_server="${MCP_PUBLIC_URL}"`);
+      sendJson(res, 401, {
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Missing bearer token. Complete OAuth authorization first.' },
+        id: null
+      });
+      return;
+    }
+  }
+
+  const sessionId = req.headers['mcp-session-id'];
+
+  try {
+    if (req.method === 'POST') {
+      const parsedBody = await collectBody(req);
+
+      let entry = sessionId ? sessions.get(sessionId) : null;
+
+      if (!entry) {
+        if (!isInitializeRequest(parsedBody)) {
+          sendJson(res, 400, {
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'No valid session. Initialize first.' },
+            id: null
+          });
+          return;
+        }
+
+        const mcpServer = createServer();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            sessions.set(sid, { transport, mcpServer });
+          }
+        });
+
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid) sessions.delete(sid);
+        };
+
+        await mcpServer.connect(transport);
+        await transport.handleRequest(req, res, parsedBody);
+        return;
+      }
+
+      await entry.transport.handleRequest(req, res, parsedBody);
+      return;
+    }
+
+    if (req.method === 'GET' || req.method === 'DELETE') {
+      const entry = sessionId ? sessions.get(sessionId) : null;
+      if (!entry) {
+        if (req.method === 'GET') {
+          // Streamable HTTP servers may choose not to support standalone SSE streams.
+          // Returning 405 tells clients to proceed without SSE fallback.
+          sendJson(res, 405, {
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'GET stream not supported without active session' },
+            id: null
+          });
+          return;
+        }
+
+        sendJson(res, 400, {
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Invalid or missing session ID' },
+          id: null
+        });
+        return;
+      }
+
+      await entry.transport.handleRequest(req, res);
+      return;
+    }
+
+    sendJson(res, 405, {
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed' },
+      id: null
+    });
+  } catch (error) {
+    sendJson(res, 500, {
+      jsonrpc: '2.0',
+      error: { code: -32603, message: error instanceof Error ? error.message : 'Internal error' },
+      id: null
+    });
+  }
+});
+
+httpServer.listen(MCP_PORT, () => {
+  console.log(`External MCP connector listening at http://localhost:${MCP_PORT}/mcp`);
+});
