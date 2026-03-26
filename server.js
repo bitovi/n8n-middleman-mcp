@@ -5,6 +5,8 @@ import fetch from 'node-fetch';
 import * as z from 'zod/v4';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 function loadDotEnv(path = '.env') {
@@ -39,6 +41,8 @@ const MS_TENANT_ID = process.env.MS_TENANT_ID || 'common';
 const MS_CLIENT_ID = process.env.MS_CLIENT_ID;
 const MS_SCOPES = process.env.MS_SCOPES || 'openid profile offline_access User.Read';
 const N8N_DEFAULT_WEBHOOK_URL = process.env.N8N_DEFAULT_WEBHOOK_URL;
+const N8N_MCP_URL = process.env.N8N_MCP;
+const N8N_MCP_AUTH_TOKEN = process.env.N8N_MCP_AUTH_TOKEN;
 const MCP_PORT = Number(process.env.MCP_PORT || 8787);
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL;
 
@@ -59,6 +63,14 @@ const issuedRefreshTokens = new Map();
 
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
+const WORKFLOW_DISCOVERY_CACHE_TTL_MS = 60 * 1000;
+
+let n8nMcpClient = null;
+let n8nMcpTransport = null;
+let n8nWorkflowCache = {
+  expires_at: 0,
+  workflows: []
+};
 
 function base64UrlEncode(buf) {
   return Buffer.from(buf)
@@ -168,7 +180,112 @@ async function ensureUsableToken(userId) {
   return refreshAccessToken(userId);
 }
 
-function createServer() {
+async function ensureN8nMcpClient() {
+  if (n8nMcpClient && n8nMcpTransport) return n8nMcpClient;
+  if (!N8N_MCP_URL) {
+    throw new Error('N8N_MCP environment variable is not configured.');
+  }
+
+  const requestInit = N8N_MCP_AUTH_TOKEN
+    ? {
+        headers: {
+          Authorization: `Bearer ${N8N_MCP_AUTH_TOKEN}`
+        }
+      }
+    : undefined;
+
+  const client = new Client({ name: 'n8n-middleman-upstream-client', version: '1.0.0' });
+  const transport = new StreamableHTTPClientTransport(new URL(N8N_MCP_URL), { requestInit });
+
+  transport.onclose = () => {
+    n8nMcpClient = null;
+    n8nMcpTransport = null;
+  };
+
+  await client.connect(transport);
+  n8nMcpClient = client;
+  n8nMcpTransport = transport;
+  return client;
+}
+
+function extractToolPayload(result) {
+  if (result?.structuredContent && typeof result.structuredContent === 'object') {
+    return result.structuredContent;
+  }
+
+  if (Array.isArray(result?.content)) {
+    const textPart = result.content.find((item) => item?.type === 'text' && typeof item.text === 'string');
+    if (textPart?.text) {
+      try {
+        return JSON.parse(textPart.text);
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function callN8nMcpTool(name, args = {}) {
+  const client = await ensureN8nMcpClient();
+  return client.callTool({ name, arguments: args });
+}
+
+function slugifyName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+}
+
+async function discoverWorkflowsFromN8n() {
+  const now = nowMs();
+  if (n8nWorkflowCache.expires_at > now && n8nWorkflowCache.workflows.length > 0) {
+    return n8nWorkflowCache.workflows;
+  }
+
+  const searchResult = await callN8nMcpTool('search_workflows', { limit: 200 });
+  const searchPayload = extractToolPayload(searchResult);
+  const workflows = Array.isArray(searchPayload?.data) ? searchPayload.data : [];
+
+  const withDetails = await Promise.all(
+    workflows.map(async (workflow) => {
+      try {
+        const detailResult = await callN8nMcpTool('get_workflow_details', {
+          workflowId: workflow.id
+        });
+        const detailPayload = extractToolPayload(detailResult);
+        return {
+          id: workflow.id,
+          name: workflow.name || detailPayload?.workflow?.name || `workflow_${workflow.id}`,
+          description:
+            detailPayload?.workflow?.description ||
+            workflow.description ||
+            `n8n workflow ${workflow.id}`,
+          triggerInfo: detailPayload?.triggerInfo || ''
+        };
+      } catch (error) {
+        return {
+          id: workflow.id,
+          name: workflow.name || `workflow_${workflow.id}`,
+          description: workflow.description || `n8n workflow ${workflow.id}`,
+          triggerInfo: `Unable to fetch trigger details: ${error instanceof Error ? error.message : String(error)}`
+        };
+      }
+    })
+  );
+
+  n8nWorkflowCache = {
+    expires_at: now + WORKFLOW_DISCOVERY_CACHE_TTL_MS,
+    workflows: withDetails
+  };
+
+  return withDetails;
+}
+
+async function createServer() {
   const server = new McpServer(
     {
       name: 'n8n-middleman-ms-connector',
@@ -182,74 +299,77 @@ function createServer() {
     }
   );
 
-  server.registerTool(
-  'call_n8n_workflow',
-  {
-    description:
-      'Call an n8n webhook/workflow endpoint and automatically include the Microsoft access token in headers.',
-    inputSchema: {
-      url: z.string().optional().describe('Full n8n webhook URL. Falls back to N8N_DEFAULT_WEBHOOK_URL env.'),
-      method: z.string().optional().describe('HTTP method. Default POST.'),
-      body: z.any().optional().describe('Request body JSON.'),
-      headers: z.record(z.string(), z.string()).optional().describe('Additional headers to send.')
-    }
-  },
-  async ({ url, method, body, headers }) => {
-    const targetUrl = url || N8N_DEFAULT_WEBHOOK_URL;
-    if (!targetUrl) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: 'No workflow URL provided. Pass url or set N8N_DEFAULT_WEBHOOK_URL.'
-          }
-        ]
-      };
-    }
+  if (N8N_MCP_URL) {
+    try {
+      const workflows = await discoverWorkflowsFromN8n();
+      const usedNames = new Set();
 
-    const tokens = await ensureUsableToken(MCP_USER);
-    if (!tokens?.access_token) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: 'No Microsoft access token available. Reconnect this MCP server via Claude OAuth and try again.'
-          }
-        ]
-      };
-    }
-
-    const requestHeaders = {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${tokens.access_token}`,
-      'x-ms-access-token': tokens.access_token,
-      'x-ms-user': MCP_USER,
-      ...(headers || {})
-    };
-
-    const response = await fetch(targetUrl, {
-      method: (method || 'POST').toUpperCase(),
-      headers: requestHeaders,
-      body: body === undefined ? undefined : JSON.stringify(body)
-    });
-
-    const text = await response.text();
-    return {
-      content: [
-        {
-          type: 'text',
-          text:
-            `n8n call completed.\n` +
-            `Status: ${response.status} ${response.statusText}\n` +
-            `URL: ${targetUrl}\n\n` +
-            `${text}`
+      for (const workflow of workflows) {
+        const baseName = slugifyName(workflow.name) || 'workflow';
+        let toolName = `n8n_workflow_${baseName}_${String(workflow.id).slice(0, 8)}`;
+        let dedupe = 1;
+        while (usedNames.has(toolName)) {
+          dedupe += 1;
+          toolName = `n8n_workflow_${baseName}_${String(workflow.id).slice(0, 8)}_${dedupe}`;
         }
-      ]
-    };
+        usedNames.add(toolName);
+
+        server.registerTool(
+          toolName,
+          {
+            description:
+              `Execute n8n workflow "${workflow.name}" (id: ${workflow.id}). ` +
+              `${workflow.description || ''} ${workflow.triggerInfo || ''}`.trim(),
+            inputSchema: {
+              inputs: z
+                .any()
+                .optional()
+                .describe('Optional inputs passed through to n8n execute_workflow.inputs')
+            }
+          },
+          async ({ inputs }) => {
+            try {
+              const result = await callN8nMcpTool('execute_workflow', {
+                workflowId: workflow.id,
+                ...(inputs === undefined ? {} : { inputs })
+              });
+              const payload = extractToolPayload(result);
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify(
+                      {
+                        workflowId: workflow.id,
+                        workflowName: workflow.name,
+                        result: payload || result
+                      },
+                      null,
+                      2
+                    )
+                  }
+                ]
+              };
+            } catch (error) {
+              return {
+                isError: true,
+                content: [
+                  {
+                    type: 'text',
+                    text: `Failed to execute workflow ${workflow.id}: ${error instanceof Error ? error.message : String(error)}`
+                  }
+                ]
+              };
+            }
+          }
+        );
+      }
+    } catch (error) {
+      console.error('[n8n-mcp] Failed to discover workflows for dynamic tool registration:',
+        error instanceof Error ? error.message : error
+      );
+    }
   }
-  );
 
   return server;
 }
@@ -692,7 +812,7 @@ const httpServer = http.createServer(async (req, res) => {
           return;
         }
 
-        const mcpServer = createServer();
+        const mcpServer = await createServer();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {

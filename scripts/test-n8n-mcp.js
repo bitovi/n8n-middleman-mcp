@@ -44,11 +44,21 @@ async function main() {
     throw new Error('N8N_MCP is missing. Set it in .env or your shell env.');
   }
 
+  const n8nMcpAuthToken = process.env.N8N_MCP_AUTH_TOKEN;
+
   const testToolName = process.env.TEST_TOOL_NAME;
   const testToolArgs = parseJsonEnv('TEST_TOOL_ARGS', {});
 
   const client = new Client({ name: 'n8n-mcp-test-client', version: '1.0.0' });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint));
+  const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
+    requestInit: n8nMcpAuthToken
+      ? {
+          headers: {
+            Authorization: `Bearer ${n8nMcpAuthToken}`
+          }
+        }
+      : undefined
+  });
 
   console.log(`[test] Connecting to n8n MCP: ${endpoint}`);
   await client.connect(transport);
@@ -62,6 +72,11 @@ async function main() {
       for (const name of tools.slice(0, 25).map((t) => t.name)) {
         console.log(`  - ${name}`);
       }
+    }
+
+    if (process.env.VERBOSE_TOOL_SCHEMAS === '1') {
+      console.log('[test] Full tool definitions:');
+      console.log(JSON.stringify(tools, null, 2));
     }
 
     if (!testToolName) {
