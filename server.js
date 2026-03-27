@@ -240,22 +240,152 @@ function slugifyName(value) {
     .slice(0, 48);
 }
 
-function buildWorkflowInputsWithAccessToken(inputs, accessToken) {
-  if (inputs === undefined) {
-    return { access_token: accessToken };
-  }
+function parseWorkflowDescription(rawDescription) {
+  const fullText = String(rawDescription || '').replace(/\r\n/g, '\n');
+  const lines = fullText.split('\n');
+  const summary = (lines[0] || '').trim();
+  const metadataText = lines.slice(1).join('\n').trim();
 
-  if (inputs && typeof inputs === 'object' && !Array.isArray(inputs)) {
-    return {
-      ...inputs,
-      access_token: accessToken
-    };
+  /** @type {Record<string, string>} */
+  const inputHints = {};
+  let returnImmediately = false;
+
+  if (metadataText) {
+    try {
+      const parsed = JSON.parse(metadataText);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const parsedVars = parsed.vars && typeof parsed.vars === 'object' && !Array.isArray(parsed.vars)
+          ? parsed.vars
+          : parsed;
+
+        for (const [key, value] of Object.entries(parsedVars)) {
+          if (key === 'return_immediately') continue;
+          if (!key) continue;
+          inputHints[key] = typeof value === 'string' ? value : String(value);
+        }
+
+        const returnImmediatelyValue = parsed.return_immediately;
+        if (typeof returnImmediatelyValue === 'boolean') {
+          returnImmediately = returnImmediatelyValue;
+        } else if (typeof returnImmediatelyValue === 'string') {
+          returnImmediately = returnImmediatelyValue.toLowerCase().trim() === 'true';
+        }
+      }
+    } catch {
+      // Ignore invalid JSON and fall back to generic input handling.
+    }
   }
 
   return {
-    input: inputs,
-    access_token: accessToken
+    summary,
+    inputHints,
+    returnImmediately
   };
+}
+
+function inferWorkflowInputType(triggerInfo) {
+  const info = String(triggerInfo || '').toLowerCase();
+  if (info.includes('webhook')) return 'webhook';
+  if (info.includes('form')) return 'form';
+  return 'chat';
+}
+
+function normalizeWorkflowInputType(value, fallbackType) {
+  const normalized = typeof value === 'string' ? value.toLowerCase().trim() : '';
+  if (normalized === 'chat' || normalized === 'form' || normalized === 'webhook') {
+    return normalized;
+  }
+  return fallbackType;
+}
+
+function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerInfo, hasInputHints = false) {
+  const inferredType = inferWorkflowInputType(triggerInfo);
+
+  // When we expose per-field tool args from description JSON, those args should map
+  // directly to the workflow payload body/data for the inferred trigger type.
+  if (hasInputHints) {
+    const hintedValues = inputs && typeof inputs === 'object' && !Array.isArray(inputs) ? inputs : {};
+    if (inferredType === 'webhook') {
+      return {
+        type: 'webhook',
+        webhookData: {
+          method: 'POST',
+          body: {
+            ...hintedValues,
+            access_token: accessToken
+          }
+        }
+      };
+    }
+
+    if (inferredType === 'form') {
+      return {
+        type: 'form',
+        formData: {
+          ...hintedValues,
+          access_token: accessToken
+        }
+      };
+    }
+
+    if (typeof hintedValues.chatInput === 'string') {
+      return {
+        type: 'chat',
+        chatInput: hintedValues.chatInput
+      };
+    }
+
+    return undefined;
+  }
+
+  if (inputs === undefined) {
+    return undefined;
+  }
+
+  if (inputs && typeof inputs === 'object' && !Array.isArray(inputs)) {
+    const safeType = normalizeWorkflowInputType(inputs.type, inferredType);
+
+    if (safeType === 'webhook') {
+      const webhookData = inputs.webhookData && typeof inputs.webhookData === 'object'
+        ? inputs.webhookData
+        : {};
+      const body = webhookData.body && typeof webhookData.body === 'object'
+        ? webhookData.body
+        : {};
+      return {
+        type: 'webhook',
+        webhookData: {
+          method: webhookData.method || 'POST',
+          ...(webhookData.query ? { query: webhookData.query } : {}),
+          ...(webhookData.headers ? { headers: webhookData.headers } : {}),
+          body: {
+            ...body,
+            access_token: accessToken
+          }
+        }
+      };
+    }
+
+    if (safeType === 'form') {
+      const formData = inputs.formData && typeof inputs.formData === 'object'
+        ? inputs.formData
+        : {};
+      return {
+        type: 'form',
+        formData: {
+          ...formData,
+          access_token: accessToken
+        }
+      };
+    }
+
+    return {
+      type: 'chat',
+      chatInput: typeof inputs.chatInput === 'string' ? inputs.chatInput : ''
+    };
+  }
+
+  return undefined;
 }
 
 async function discoverWorkflowsFromN8n() {
@@ -332,30 +462,91 @@ async function createServer() {
         }
         usedNames.add(toolName);
 
-        server.registerTool(
-          toolName,
-          {
-            description:
-              `Execute n8n workflow "${workflow.name}" (id: ${workflow.id}). ` +
-              `${workflow.description || ''} ${workflow.triggerInfo || ''}`.trim(),
-            inputSchema: {
+        const parsedDescription = parseWorkflowDescription(workflow.description);
+        const hasInputHints = Object.keys(parsedDescription.inputHints).length > 0;
+
+        const inputSchema = hasInputHints
+          ? Object.fromEntries(
+              Object.entries(parsedDescription.inputHints).map(([key, hint]) => [
+                key,
+                z.any().optional().describe(hint)
+              ])
+            )
+          : {
               inputs: z
                 .any()
                 .optional()
-                .describe('Optional inputs passed through to n8n execute_workflow.inputs (`access_token` is always injected from the current user Microsoft session).')
-            }
+                .describe('Optional complete n8n execute_workflow.inputs object. For description-based args, this connector maps values into webhookData/formData automatically.')
+            };
+
+        const toolDescriptionParts = [
+          `Execute n8n workflow "${workflow.name}" (id: ${workflow.id}).`,
+          parsedDescription.summary,
+          parsedDescription.returnImmediately
+            ? 'Configured to return immediately without waiting for workflow completion.'
+            : 'Configured to wait for workflow completion before returning.',
+          workflow.triggerInfo ? `Trigger info: ${workflow.triggerInfo}` : ''
+        ].filter(Boolean);
+
+        server.registerTool(
+          toolName,
+          {
+            description: toolDescriptionParts.join(' ').trim(),
+            inputSchema
           },
-          async ({ inputs }) => {
+          async (args) => {
             try {
               const userTokens = await ensureUsableToken(MCP_USER);
               if (!userTokens?.access_token) {
                 throw new Error('No valid Microsoft access token available. Re-authenticate and try again.');
               }
 
-              const result = await callN8nMcpTool('execute_workflow', {
+              const workflowInputs = hasInputHints
+                ? (args && typeof args === 'object' ? args : undefined)
+                : args?.inputs;
+
+              const executeWorkflowArgs = {
                 workflowId: workflow.id,
-                inputs: buildWorkflowInputsWithAccessToken(inputs, userTokens.access_token)
-              });
+                ...(buildWorkflowInputsWithAccessToken(workflowInputs, userTokens.access_token, workflow.triggerInfo, hasInputHints)
+                  ? {
+                      inputs: buildWorkflowInputsWithAccessToken(
+                        workflowInputs,
+                        userTokens.access_token,
+                        workflow.triggerInfo,
+                        hasInputHints
+                      )
+                    }
+                  : {})
+              };
+
+              if (parsedDescription.returnImmediately) {
+                callN8nMcpTool('execute_workflow', executeWorkflowArgs).catch((error) => {
+                  console.error(
+                    `[n8n-mcp] Async execution failed for workflow ${workflow.id}:`,
+                    error instanceof Error ? error.message : error
+                  );
+                });
+
+                return {
+                  content: [
+                    {
+                      type: 'text',
+                      text: JSON.stringify(
+                        {
+                          workflowId: workflow.id,
+                          workflowName: workflow.name,
+                          accepted: true,
+                          message: 'Workflow execution started and is running asynchronously.'
+                        },
+                        null,
+                        2
+                      )
+                    }
+                  ]
+                };
+              }
+
+              const result = await callN8nMcpTool('execute_workflow', executeWorkflowArgs);
               const payload = extractToolPayload(result);
               return {
                 content: [
