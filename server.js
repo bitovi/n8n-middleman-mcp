@@ -240,6 +240,24 @@ function slugifyName(value) {
     .slice(0, 48);
 }
 
+function buildWorkflowInputsWithAccessToken(inputs, accessToken) {
+  if (inputs === undefined) {
+    return { access_token: accessToken };
+  }
+
+  if (inputs && typeof inputs === 'object' && !Array.isArray(inputs)) {
+    return {
+      ...inputs,
+      access_token: accessToken
+    };
+  }
+
+  return {
+    input: inputs,
+    access_token: accessToken
+  };
+}
+
 async function discoverWorkflowsFromN8n() {
   const now = nowMs();
   if (n8nWorkflowCache.expires_at > now && n8nWorkflowCache.workflows.length > 0) {
@@ -324,14 +342,19 @@ async function createServer() {
               inputs: z
                 .any()
                 .optional()
-                .describe('Optional inputs passed through to n8n execute_workflow.inputs')
+                .describe('Optional inputs passed through to n8n execute_workflow.inputs (`access_token` is always injected from the current user Microsoft session).')
             }
           },
           async ({ inputs }) => {
             try {
+              const userTokens = await ensureUsableToken(MCP_USER);
+              if (!userTokens?.access_token) {
+                throw new Error('No valid Microsoft access token available. Re-authenticate and try again.');
+              }
+
               const result = await callN8nMcpTool('execute_workflow', {
                 workflowId: workflow.id,
-                ...(inputs === undefined ? {} : { inputs })
+                inputs: buildWorkflowInputsWithAccessToken(inputs, userTokens.access_token)
               });
               const payload = extractToolPayload(result);
               return {

@@ -36,6 +36,98 @@ function parseJsonEnv(name, fallback) {
   }
 }
 
+function buildCandidateEndpoints(rawEndpoint) {
+  const clean = String(rawEndpoint || '').trim();
+  if (!clean) return [];
+
+  const withoutTrailingSlash = clean.replace(/\/+$/, '');
+  const candidates = [
+    clean,
+    withoutTrailingSlash,
+    `${withoutTrailingSlash}/mcp`,
+    `${withoutTrailingSlash}/mcp/`,
+    `${withoutTrailingSlash}/mcp-server/http`,
+    `${withoutTrailingSlash}/mcp-server/http/`,
+    `${withoutTrailingSlash}/mcp-server/sse`,
+    `${withoutTrailingSlash}/mcp-server/sse/`,
+    `${withoutTrailingSlash}/rest/mcp`,
+    `${withoutTrailingSlash}/api/mcp`
+  ];
+
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function extractPayload(result) {
+  if (result?.structuredContent && typeof result.structuredContent === 'object') {
+    return result.structuredContent;
+  }
+
+  if (Array.isArray(result?.content)) {
+    const textPart = result.content.find((item) => item?.type === 'text' && typeof item.text === 'string');
+    if (textPart?.text) {
+      try {
+        return JSON.parse(textPart.text);
+      } catch {
+        return { text: textPart.text };
+      }
+    }
+  }
+
+  return result ?? null;
+}
+
+function extractWorkflows(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+
+  const candidates = [
+    payload.data,
+    payload.workflows,
+    payload.items,
+    payload.results,
+    payload.result?.data,
+    payload.result?.workflows,
+    payload.result?.items
+  ];
+
+  for (const value of candidates) {
+    if (Array.isArray(value)) {
+      return value;
+    }
+  }
+
+  return [];
+}
+
+async function connectWithEndpointFallback(client, endpoint, requestInit) {
+  const endpoints = buildCandidateEndpoints(endpoint);
+  let lastError = null;
+
+  for (const candidate of endpoints) {
+    const transport = new StreamableHTTPClientTransport(new URL(candidate), { requestInit });
+
+    try {
+      console.log(`[test] Trying MCP endpoint: ${candidate}`);
+      await client.connect(transport);
+      return { transport, endpoint: candidate };
+    } catch (error) {
+      lastError = error;
+      await transport.close().catch(() => {});
+      console.log(
+        `[test] Connection failed for ${candidate}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  const lastErrorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+  const authHint = /unauthorized|invalid signature|401/i.test(lastErrorMessage)
+    ? ' Hint: n8n MCP endpoint appears reachable but your N8N_MCP_AUTH_TOKEN is invalid/expired. Rotate or recreate the MCP API key in n8n and update .env.'
+    : '';
+
+  throw new Error(
+    `Unable to connect to n8n MCP. Tried: ${endpoints.join(', ')}. Last error: ${lastErrorMessage}.${authHint}`
+  );
+}
+
 async function main() {
   loadDotEnv();
 
@@ -50,18 +142,17 @@ async function main() {
   const testToolArgs = parseJsonEnv('TEST_TOOL_ARGS', {});
 
   const client = new Client({ name: 'n8n-mcp-test-client', version: '1.0.0' });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
-    requestInit: n8nMcpAuthToken
-      ? {
-          headers: {
-            Authorization: `Bearer ${n8nMcpAuthToken}`
-          }
+  const requestInit = n8nMcpAuthToken
+    ? {
+        headers: {
+          Authorization: `Bearer ${n8nMcpAuthToken}`
         }
-      : undefined
-  });
+      }
+    : undefined;
 
-  console.log(`[test] Connecting to n8n MCP: ${endpoint}`);
-  await client.connect(transport);
+  console.log(`[test] Connecting to n8n MCP (base): ${endpoint}`);
+  const { transport, endpoint: resolvedEndpoint } = await connectWithEndpointFallback(client, endpoint, requestInit);
+  console.log(`[test] Connected using endpoint: ${resolvedEndpoint}`);
 
   try {
     const { tools = [] } = await client.listTools();
@@ -77,6 +168,33 @@ async function main() {
     if (process.env.VERBOSE_TOOL_SCHEMAS === '1') {
       console.log('[test] Full tool definitions:');
       console.log(JSON.stringify(tools, null, 2));
+    }
+
+    const searchWorkflowsTool = tools.find((tool) => tool.name === 'search_workflows');
+    if (searchWorkflowsTool) {
+      console.log('[test] Detected search_workflows tool, running discovery check...');
+      try {
+        const searchResult = await client.callTool({
+          name: 'search_workflows',
+          arguments: { limit: 50 }
+        });
+        const payload = extractPayload(searchResult);
+        const workflows = extractWorkflows(payload);
+        console.log(`[test] search_workflows returned ${workflows.length} workflow(s).`);
+        if (workflows.length > 0) {
+          console.log('[test] Workflow preview:');
+          for (const wf of workflows.slice(0, 10)) {
+            const id = wf?.id ?? wf?.workflowId ?? wf?.workflow_id ?? '(no id)';
+            const name = wf?.name ?? wf?.title ?? '(no name)';
+            console.log(`  - ${name} [${id}]`);
+          }
+        } else {
+          console.log('[test] search_workflows payload (no array detected):');
+          console.log(JSON.stringify(payload, null, 2));
+        }
+      } catch (error) {
+        console.log(`[test] search_workflows check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
 
     if (!testToolName) {
