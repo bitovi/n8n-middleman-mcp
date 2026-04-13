@@ -2,15 +2,8 @@ import { randomUUID } from 'node:crypto';
 import fetch from 'node-fetch';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import {
-  ACCESS_TOKEN_TTL_MS,
-  AUTH_CODE_TTL_MS,
-  cleanupExpiredAuthArtifacts,
-  issuedAuthCodes,
-  issuedRefreshTokens,
-  pendingClaudeAuth,
-  tokenStore
-} from '../auth/stores.js';
+import { ACCESS_TOKEN_TTL_MS, AUTH_CODE_TTL_MS, REFRESH_TOKEN_TTL_MS } from '../auth/constants.js';
+import { authStore } from '../auth/storeFactory.js';
 import { logAuthEvent, parseBasicAuthClient, parseBearerToken, verifyPkce } from '../auth/oauth.js';
 import {
   AUTHORIZE_URL,
@@ -21,13 +14,19 @@ import {
   TOKEN_URL,
   buildPublicUrl
 } from '../config.js';
+import {
+  InvalidGrantError,
+  InvalidRequestError,
+  MethodNotAllowedError,
+  NotFoundError,
+  UnauthorizedError,
+  UnsupportedGrantTypeError
+} from '../errors/AppError.js';
+import { respondWithError } from '../errors/respondWithError.js';
 import { createServer } from '../mcp/createServer.js';
+import { sessionStore } from '../mcp/sessionStoreFactory.js';
 import { nowMs, randomToken } from '../utils/crypto.js';
 import { collectBody, collectRawBody, sendJson, sendRedirect, sendText } from '../utils/http.js';
-
-// TODO: Move session storage to a shared persistent/session-capable backend (e.g., Redis)
-// so active MCP sessions survive process restarts and work across multiple instances.
-const sessions = new Map();
 
 function logRequestEvent(req, pathname, extra = {}) {
   console.log('[http]', {
@@ -44,7 +43,7 @@ function isMcpEndpointPath(pathname) {
 }
 
 export async function handleRequest(req, res) {
-  cleanupExpiredAuthArtifacts();
+  authStore.cleanupExpiredAuthArtifacts();
 
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = requestUrl.pathname;
@@ -120,7 +119,7 @@ export async function handleRequest(req, res) {
     }
 
     const localState = randomToken(24);
-    pendingClaudeAuth.set(localState, {
+    authStore.setPendingClaudeAuth(localState, {
       client_id: clientId,
       redirect_uri: redirectUri,
       state,
@@ -173,14 +172,14 @@ export async function handleRequest(req, res) {
       return;
     }
 
-    const pending = pendingClaudeAuth.get(state);
+    const pending = authStore.getPendingClaudeAuth(state);
     if (!pending) {
       logAuthEvent('oauth_callback.invalid_state');
       sendText(res, 400, 'Authorization session expired or invalid state.');
       return;
     }
 
-    pendingClaudeAuth.delete(state);
+    authStore.deletePendingClaudeAuth(state);
 
     const msRedirectUri = buildPublicUrl('/oauth/callback');
     const tokenBody = new URLSearchParams({
@@ -217,13 +216,13 @@ export async function handleRequest(req, res) {
       expires_at: nowMs() + Number(tokenJson.expires_in || 3600) * 1000
     };
 
-    tokenStore.set(MCP_USER, msTokens);
+    authStore.setUserTokens(MCP_USER, msTokens);
 
     const claudeAuthCode = randomToken(24);
     const mcpAccessToken = randomToken(32);
     const refreshToken = randomToken(32);
 
-    issuedAuthCodes.set(claudeAuthCode, {
+    authStore.setAuthCode(claudeAuthCode, {
       client_id: pending.client_id,
       redirect_uri: pending.redirect_uri,
       scope: pending.scope,
@@ -235,11 +234,11 @@ export async function handleRequest(req, res) {
       used: false
     });
 
-    issuedRefreshTokens.set(refreshToken, {
+    authStore.setRefreshToken(refreshToken, {
       client_id: pending.client_id,
       scope: pending.scope,
       mcp_access_token: mcpAccessToken,
-      expires_at: nowMs() + 30 * 24 * 60 * 60 * 1000
+      expires_at: nowMs() + REFRESH_TOKEN_TTL_MS
     });
 
     const callbackUrl = new URL(pending.redirect_uri);
@@ -257,99 +256,99 @@ export async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && pathname === '/token') {
-    const rawBody = await collectRawBody(req);
-    const params = new URLSearchParams(rawBody);
-    const grantType = params.get('grant_type');
-    const basicClient = parseBasicAuthClient(req);
-    const clientId = params.get('client_id') || basicClient?.clientId || null;
+    try {
+      const rawBody = await collectRawBody(req);
+      const params = new URLSearchParams(rawBody);
+      const grantType = params.get('grant_type');
+      const basicClient = parseBasicAuthClient(req);
+      const clientId = params.get('client_id') || basicClient?.clientId || null;
 
-    if (!grantType) {
-      sendJson(res, 400, { error: 'invalid_request', error_description: 'grant_type is required' });
-      return;
-    }
-
-    if (grantType === 'authorization_code') {
-      const code = params.get('code');
-      const redirectUri = params.get('redirect_uri');
-      const codeVerifier = params.get('code_verifier');
-
-      const stored = code ? issuedAuthCodes.get(code) : null;
-      if (!stored || stored.used || stored.expires_at <= nowMs()) {
-        logAuthEvent('token.invalid_or_expired_code', {
-          hasCode: !!code,
-          found: !!stored,
-          used: stored?.used,
-          expired: stored ? stored.expires_at <= nowMs() : undefined
-        });
-        sendJson(res, 400, { error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
-        return;
+      if (!grantType) {
+        throw new InvalidRequestError('grant_type is required');
       }
 
-      if (!verifyPkce(codeVerifier, stored.code_challenge)) {
-        logAuthEvent('token.pkce_verification_failed', {
+      if (grantType === 'authorization_code') {
+        const code = params.get('code');
+        const redirectUri = params.get('redirect_uri');
+        const codeVerifier = params.get('code_verifier');
+
+        const stored = code ? authStore.getAuthCode(code) : null;
+        if (!stored || stored.used || stored.expires_at <= nowMs()) {
+          logAuthEvent('token.invalid_or_expired_code', {
+            hasCode: !!code,
+            found: !!stored,
+            used: stored?.used,
+            expired: stored ? stored.expires_at <= nowMs() : undefined
+          });
+          throw new InvalidGrantError('Invalid or expired authorization code');
+        }
+
+        if (!verifyPkce(codeVerifier, stored.code_challenge)) {
+          logAuthEvent('token.pkce_verification_failed', {
+            clientId,
+            redirectUri,
+            hasCodeVerifier: !!codeVerifier
+          });
+          throw new InvalidGrantError('PKCE verification failed');
+        }
+
+        authStore.markAuthCodeUsed(code);
+
+        logAuthEvent('token.authorization_code_exchanged', {
           clientId,
           redirectUri,
-          hasCodeVerifier: !!codeVerifier
+          scope: stored.scope
         });
-        sendJson(res, 400, { error: 'invalid_grant', error_description: 'PKCE verification failed' });
+
+        sendJson(res, 200, {
+          access_token: stored.mcp_access_token,
+          token_type: 'bearer',
+          expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+          refresh_token: stored.refresh_token,
+          scope: stored.scope
+        });
         return;
       }
 
-      stored.used = true;
+      if (grantType === 'refresh_token') {
+        const refreshToken = params.get('refresh_token');
+        const stored = refreshToken ? authStore.getRefreshToken(refreshToken) : null;
 
-      logAuthEvent('token.authorization_code_exchanged', {
-        clientId,
-        redirectUri,
-        scope: stored.scope
-      });
+        if (!stored || stored.expires_at <= nowMs()) {
+          logAuthEvent('token.invalid_or_expired_refresh_token', {
+            found: !!stored,
+            expired: stored ? stored.expires_at <= nowMs() : undefined
+          });
+          throw new InvalidGrantError('Invalid or expired refresh token');
+        }
 
-      sendJson(res, 200, {
-        access_token: stored.mcp_access_token,
-        token_type: 'bearer',
-        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
-        refresh_token: stored.refresh_token,
-        scope: stored.scope
-      });
-      return;
-    }
+        const nextAccessToken = randomToken(32);
+        authStore.updateRefreshToken(refreshToken, { mcp_access_token: nextAccessToken });
 
-    if (grantType === 'refresh_token') {
-      const refreshToken = params.get('refresh_token');
-      const stored = refreshToken ? issuedRefreshTokens.get(refreshToken) : null;
-
-      if (!stored || stored.expires_at <= nowMs()) {
-        logAuthEvent('token.invalid_or_expired_refresh_token', {
-          found: !!stored,
-          expired: stored ? stored.expires_at <= nowMs() : undefined
+        logAuthEvent('token.refresh_token_exchanged', {
+          clientId,
+          scope: stored.scope
         });
-        sendJson(res, 400, { error: 'invalid_grant', error_description: 'Invalid or expired refresh token' });
+
+        sendJson(res, 200, {
+          access_token: nextAccessToken,
+          token_type: 'bearer',
+          expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+          refresh_token: refreshToken,
+          scope: stored.scope
+        });
         return;
       }
 
-      const nextAccessToken = randomToken(32);
-      stored.mcp_access_token = nextAccessToken;
-
-      logAuthEvent('token.refresh_token_exchanged', {
-        clientId,
-        scope: stored.scope
-      });
-
-      sendJson(res, 200, {
-        access_token: nextAccessToken,
-        token_type: 'bearer',
-        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
-        refresh_token: refreshToken,
-        scope: stored.scope
-      });
-      return;
+      throw new UnsupportedGrantTypeError('unsupported_grant_type');
+    } catch (error) {
+      respondWithError(res, error, 'oauth');
     }
-
-    sendJson(res, 400, { error: 'unsupported_grant_type' });
     return;
   }
 
   if (!isMcpEndpointPath(pathname)) {
-    sendJson(res, 404, { error: 'Not found' });
+    respondWithError(res, new NotFoundError('Not found'));
     return;
   }
 
@@ -362,13 +361,15 @@ export async function handleRequest(req, res) {
         hasAuthorizationHeader: typeof req.headers.authorization === 'string',
         method: req.method
       });
-      res.statusCode = 401;
-      res.setHeader('WWW-Authenticate', `Bearer realm="mcp", authorization_uri="${buildPublicUrl('/authorize')}", token_uri="${buildPublicUrl('/token')}", resource_metadata="${resourceMetadata}", authorization_server="${MCP_PUBLIC_URL}"`);
-      sendJson(res, 401, {
-        jsonrpc: '2.0',
-        error: { code: -32001, message: 'Missing bearer token. Complete OAuth authorization first.' },
-        id: null
-      });
+      respondWithError(
+        res,
+        new UnauthorizedError('Missing bearer token. Complete OAuth authorization first.', {
+          headers: {
+            'WWW-Authenticate': `Bearer realm="mcp", authorization_uri="${buildPublicUrl('/authorize')}", token_uri="${buildPublicUrl('/token')}", resource_metadata="${resourceMetadata}", authorization_server="${MCP_PUBLIC_URL}"`
+          }
+        }),
+        'mcp'
+      );
       return;
     }
   }
@@ -379,15 +380,11 @@ export async function handleRequest(req, res) {
     if (req.method === 'POST') {
       const parsedBody = await collectBody(req);
 
-      const entry = sessionId ? sessions.get(sessionId) : null;
+      const entry = sessionStore.getSession(sessionId);
 
       if (!entry) {
         if (!isInitializeRequest(parsedBody)) {
-          sendJson(res, 400, {
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'No valid session. Initialize first.' },
-            id: null
-          });
+          throw new InvalidRequestError('No valid session. Initialize first.');
           return;
         }
 
@@ -395,13 +392,13 @@ export async function handleRequest(req, res) {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
-            sessions.set(sid, { transport, mcpServer });
+            sessionStore.setSession(sid, { transport, mcpServer });
           }
         });
 
         transport.onclose = () => {
           const sid = transport.sessionId;
-          if (sid) sessions.delete(sid);
+          if (sid) sessionStore.deleteSession(sid);
         };
 
         await mcpServer.connect(transport);
@@ -414,22 +411,14 @@ export async function handleRequest(req, res) {
     }
 
     if (req.method === 'GET' || req.method === 'DELETE') {
-      const entry = sessionId ? sessions.get(sessionId) : null;
+      const entry = sessionStore.getSession(sessionId);
       if (!entry) {
         if (req.method === 'GET') {
-          sendJson(res, 405, {
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'GET stream not supported without active session' },
-            id: null
-          });
+          throw new MethodNotAllowedError('GET stream not supported without active session');
           return;
         }
 
-        sendJson(res, 400, {
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Invalid or missing session ID' },
-          id: null
-        });
+        throw new InvalidRequestError('Invalid or missing session ID');
         return;
       }
 
@@ -437,16 +426,8 @@ export async function handleRequest(req, res) {
       return;
     }
 
-    sendJson(res, 405, {
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Method not allowed' },
-      id: null
-    });
+    throw new MethodNotAllowedError('Method not allowed');
   } catch (error) {
-    sendJson(res, 500, {
-      jsonrpc: '2.0',
-      error: { code: -32603, message: error instanceof Error ? error.message : 'Internal error' },
-      id: null
-    });
+    respondWithError(res, error, 'mcp');
   }
 }

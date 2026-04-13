@@ -1,7 +1,7 @@
 import fetch from 'node-fetch';
 import { MS_CLIENT_ID, MS_SCOPES, TOKEN_URL } from '../config.js';
 import { nowMs, sha256Base64Url } from '../utils/crypto.js';
-import { tokenStore } from './stores.js';
+import { authStore } from './storeFactory.js';
 
 export function parseBearerToken(req) {
   const auth = req.headers.authorization;
@@ -34,7 +34,7 @@ export function hasValidAccessToken(tokens) {
 }
 
 export async function refreshAccessToken(userId) {
-  const existing = tokenStore.get(userId);
+  const existing = authStore.getUserTokens(userId);
   if (!existing?.refresh_token) return null;
 
   const body = new URLSearchParams({
@@ -62,12 +62,12 @@ export async function refreshAccessToken(userId) {
     expires_at: nowMs() + Number(json.expires_in || 3600) * 1000
   };
 
-  tokenStore.set(userId, merged);
+  authStore.setUserTokens(userId, merged);
   return merged;
 }
 
 export async function ensureUsableToken(userId) {
-  const existing = tokenStore.get(userId);
+  const existing = authStore.getUserTokens(userId);
   if (hasValidAccessToken(existing)) return existing;
   return refreshAccessToken(userId);
 }
