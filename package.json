@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"No tests configured\"",
+    "test": "MS_CLIENT_ID=test-client node --test test/*.test.js",
     "test:n8n-mcp": "node scripts/test-n8n-mcp.js"
   },
   "keywords": [],
