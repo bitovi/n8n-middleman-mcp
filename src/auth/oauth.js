@@ -1,5 +1,5 @@
 import fetch from 'node-fetch';
-import { MS_CLIENT_ID, MS_SCOPES, TOKEN_URL } from '../config.js';
+import { OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_SCOPES, TOKEN_URL } from '../config.js';
 import { nowMs, sha256Base64Url } from '../utils/crypto.js';
 import { authStore } from './storeFactory.js';
 
@@ -38,11 +38,15 @@ export async function refreshAccessToken(userId) {
   if (!existing?.refresh_token) return null;
 
   const body = new URLSearchParams({
-    client_id: MS_CLIENT_ID,
+    client_id: OAUTH_CLIENT_ID,
     grant_type: 'refresh_token',
     refresh_token: existing.refresh_token,
-    scope: MS_SCOPES
+    scope: OAUTH_SCOPES
   });
+
+  if (OAUTH_CLIENT_SECRET) {
+    body.set('client_secret', OAUTH_CLIENT_SECRET);
+  }
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',

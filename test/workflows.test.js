@@ -37,6 +37,7 @@ test('buildWorkflowInputsWithAccessToken builds hinted webhook payload with toke
   const result = buildWorkflowInputsWithAccessToken(
     { projectId: 123 },
     'access-token',
+    'google',
     'Webhook trigger',
     true
   );
@@ -47,7 +48,8 @@ test('buildWorkflowInputsWithAccessToken builds hinted webhook payload with toke
       method: 'POST',
       body: {
         projectId: 123,
-        access_token: 'access-token'
+        access_token: 'access-token',
+        provider: 'google'
       }
     }
   });
@@ -57,6 +59,7 @@ test('buildWorkflowInputsWithAccessToken handles explicit form inputs without hi
   const result = buildWorkflowInputsWithAccessToken(
     { type: 'form', formData: { a: 1 } },
     'token-2',
+    'microsoft',
     'Form trigger',
     false
   );
@@ -65,7 +68,8 @@ test('buildWorkflowInputsWithAccessToken handles explicit form inputs without hi
     type: 'form',
     formData: {
       a: 1,
-      access_token: 'token-2'
+      access_token: 'token-2',
+      provider: 'microsoft'
     }
   });
 });

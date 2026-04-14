@@ -2,7 +2,7 @@
 
 This project is an MCP (Model Context Protocol) connector that sits between an MCP client (like Claude Desktop) and an n8n MCP server.
 
-It handles **Microsoft OAuth**, stores the Microsoft token in memory, dynamically discovers n8n workflows, and exposes those workflows as MCP tools.
+It handles **OAuth with Microsoft or Google** (selected by `.env`), stores the provider token in memory, dynamically discovers n8n workflows, and exposes those workflows as MCP tools.
 
 ---
 
@@ -15,10 +15,10 @@ It handles **Microsoft OAuth**, stores the Microsoft token in memory, dynamicall
   - `/authorize`
   - `/token`
   - `/oauth/callback`
-- Uses Microsoft OAuth to obtain an access token
+- Uses provider OAuth (Microsoft or Google) to obtain an access token
 - Connects to an upstream n8n MCP server (`N8N_MCP`)
 - Registers one MCP tool per discovered n8n workflow
-- Injects Microsoft `access_token` into supported workflow input shapes before execution
+- Injects OAuth `access_token` and `provider` (`microsoft` or `google`) into supported workflow input shapes before execution
 
 ---
 
@@ -54,6 +54,10 @@ Then configure the app:
 3. Copy **Application (client) ID** and set it as `MS_CLIENT_ID` in `.env`.
 4. (Optional/confidential clients) Create a **Client secret** under **Certificates & secrets** and set `MS_CLIENT_SECRET`.
 
+Also set:
+
+- `OAUTH_PROVIDER=microsoft`
+
 Environment values to align with Azure:
 
 - `MS_CLIENT_ID` = Azure Application (client) ID
@@ -80,7 +84,9 @@ Create a `.env` file in the repo root.
 
 | Variable | Description |
 |---|---|
-| `MS_CLIENT_ID` | Azure app client ID used for Microsoft OAuth |
+| `OAUTH_PROVIDER` | OAuth provider: `microsoft` (default) or `google` |
+| `MS_CLIENT_ID` | Required when `OAUTH_PROVIDER=microsoft`; Azure app client ID |
+| `GOOGLE_CLIENT_ID` | Required when `OAUTH_PROVIDER=google`; Google OAuth client ID |
 
 ### Usually required for real usage
 
@@ -96,14 +102,18 @@ Create a `.env` file in the repo root.
 | `MS_TENANT_ID` | `common` | Microsoft tenant |
 | `MS_SCOPES` | `openid profile offline_access User.Read` | OAuth scopes requested from Microsoft |
 | `MS_CLIENT_SECRET` | unset | Needed for confidential client flows |
+| `GOOGLE_SCOPES` | `openid profile email` | OAuth scopes requested from Google |
+| `GOOGLE_CLIENT_SECRET` | unset | Needed for confidential Google web client flows |
 | `N8N_MCP_AUTH_TOKEN` | unset | Bearer token for n8n MCP if your upstream requires auth |
 | `N8N_DEFAULT_WEBHOOK_URL` | unset | Optional n8n webhook URL (reserved/auxiliary) |
 | `MCP_PORT` | `8787` | Local server port |
 | `MCP_USER` | `default-user` | In-memory user key for stored Microsoft tokens |
 
-Example:
+### Example: Microsoft (default)
 
 ```env
+OAUTH_PROVIDER=microsoft
+
 MS_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 MS_TENANT_ID=common
 MS_SCOPES="openid profile offline_access User.Read"
@@ -114,6 +124,24 @@ MCP_PORT=8787
 N8N_MCP=https://your-n8n-host/mcp
 N8N_MCP_AUTH_TOKEN=your_n8n_mcp_token
 ```
+
+### Example: Google
+
+```env
+OAUTH_PROVIDER=google
+
+GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GOOGLE_SCOPES="openid profile email"
+
+MCP_PUBLIC_URL=https://your-public-url.ngrok-free.app
+MCP_PORT=8787
+
+N8N_MCP=https://your-n8n-host/mcp
+N8N_MCP_AUTH_TOKEN=your_n8n_mcp_token
+```
+
+> For Google, configure your OAuth client redirect URI as: `https://<your-public-host>/oauth/callback`.
 
 ---
 
@@ -135,12 +163,17 @@ External MCP connector listening at http://localhost:8787/mcp
 
 1. MCP client requests authorization.
 2. Connector redirects to Microsoft login.
-3. Microsoft returns to `/oauth/callback`.
-4. Connector exchanges code for Microsoft tokens.
+3. OAuth provider returns to `/oauth/callback`.
+4. Connector exchanges code for provider tokens.
 5. Connector issues MCP auth code/access token/refresh token back to the MCP client.
 6. MCP client calls `/mcp` with bearer token.
 
-At tool execution time, the connector ensures a valid Microsoft access token and forwards workflow execution to n8n MCP.
+At tool execution time, the connector ensures a valid provider access token and forwards workflow execution to n8n MCP.
+
+For webhook/form workflow inputs, the connector injects:
+
+- `access_token`: provider access token
+- `provider`: `microsoft` or `google`
 
 > Current storage is in-memory (`Map` objects). Restarting the process clears sessions and tokens.
 

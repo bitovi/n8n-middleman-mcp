@@ -1,7 +1,7 @@
 {
   "name": "middleman-mcp",
   "version": "1.0.0",
-  "description": "MCP connector that authenticates with Microsoft and forwards auth context to n8n webhooks",
+  "description": "MCP connector that authenticates with Microsoft or Google and forwards auth context to n8n webhooks",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

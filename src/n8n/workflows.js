@@ -74,7 +74,7 @@ export function normalizeWorkflowInputType(value, fallbackType) {
   return fallbackType;
 }
 
-export function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerInfo, hasInputHints = false) {
+export function buildWorkflowInputsWithAccessToken(inputs, accessToken, provider, triggerInfo, hasInputHints = false) {
   const inferredType = inferWorkflowInputType(triggerInfo);
 
   if (hasInputHints) {
@@ -86,7 +86,8 @@ export function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerI
           method: 'POST',
           body: {
             ...hintedValues,
-            access_token: accessToken
+            access_token: accessToken,
+            provider
           }
         }
       };
@@ -97,7 +98,8 @@ export function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerI
         type: 'form',
         formData: {
           ...hintedValues,
-          access_token: accessToken
+          access_token: accessToken,
+          provider
         }
       };
     }
@@ -134,7 +136,8 @@ export function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerI
           ...(webhookData.headers ? { headers: webhookData.headers } : {}),
           body: {
             ...body,
-            access_token: accessToken
+            access_token: accessToken,
+            provider
           }
         }
       };
@@ -148,7 +151,8 @@ export function buildWorkflowInputsWithAccessToken(inputs, accessToken, triggerI
         type: 'form',
         formData: {
           ...formData,
-          access_token: accessToken
+          access_token: accessToken,
+          provider
         }
       };
     }

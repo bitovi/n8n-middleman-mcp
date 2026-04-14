@@ -9,8 +9,11 @@ import {
   AUTHORIZE_URL,
   MCP_USER,
   MCP_PUBLIC_URL,
-  MS_CLIENT_ID,
-  MS_SCOPES,
+  OAUTH_CLIENT_ID,
+  OAUTH_CLIENT_SECRET,
+  OAUTH_PROVIDER,
+  OAUTH_PROVIDER_LABEL,
+  OAUTH_SCOPES,
   TOKEN_URL,
   buildPublicUrl
 } from '../config.js';
@@ -136,14 +139,19 @@ export async function handleRequest(req, res) {
       codeChallengeMethod
     });
 
-    const msRedirectUri = buildPublicUrl('/oauth/callback');
+    const oauthRedirectUri = buildPublicUrl('/oauth/callback');
     const authUrl = new URL(AUTHORIZE_URL);
-    authUrl.searchParams.set('client_id', MS_CLIENT_ID);
+    authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
     authUrl.searchParams.set('response_type', 'code');
-    authUrl.searchParams.set('redirect_uri', msRedirectUri);
+    authUrl.searchParams.set('redirect_uri', oauthRedirectUri);
     authUrl.searchParams.set('response_mode', 'query');
-    authUrl.searchParams.set('scope', MS_SCOPES);
+    authUrl.searchParams.set('scope', OAUTH_SCOPES);
     authUrl.searchParams.set('state', localState);
+
+    if (OAUTH_PROVIDER === 'google') {
+      authUrl.searchParams.set('access_type', 'offline');
+      authUrl.searchParams.set('prompt', 'consent');
+    }
 
     sendRedirect(res, authUrl.toString());
     return;
@@ -162,13 +170,13 @@ export async function handleRequest(req, res) {
 
     if (error) {
       logAuthEvent('oauth_callback.microsoft_error', { error, errorDescription });
-      sendText(res, 400, `Microsoft authorization failed: ${error} ${errorDescription || ''}`.trim());
+      sendText(res, 400, `${OAUTH_PROVIDER_LABEL} authorization failed: ${error} ${errorDescription || ''}`.trim());
       return;
     }
 
     if (!code || !state) {
       logAuthEvent('oauth_callback.missing_code_or_state', { hasCode: !!code, hasState: !!state });
-      sendText(res, 400, 'Missing code or state from Microsoft callback.');
+      sendText(res, 400, `Missing code or state from ${OAUTH_PROVIDER_LABEL} callback.`);
       return;
     }
 
@@ -181,17 +189,17 @@ export async function handleRequest(req, res) {
 
     authStore.deletePendingClaudeAuth(state);
 
-    const msRedirectUri = buildPublicUrl('/oauth/callback');
+    const oauthRedirectUri = buildPublicUrl('/oauth/callback');
     const tokenBody = new URLSearchParams({
-      client_id: MS_CLIENT_ID,
+      client_id: OAUTH_CLIENT_ID,
       grant_type: 'authorization_code',
       code,
-      redirect_uri: msRedirectUri,
-      scope: MS_SCOPES
+      redirect_uri: oauthRedirectUri,
+      scope: OAUTH_SCOPES
     });
 
-    if (process.env.MS_CLIENT_SECRET) {
-      tokenBody.set('client_secret', process.env.MS_CLIENT_SECRET);
+    if (OAUTH_CLIENT_SECRET) {
+      tokenBody.set('client_secret', OAUTH_CLIENT_SECRET);
     }
 
     const tokenRes = await fetch(TOKEN_URL, {
@@ -207,7 +215,7 @@ export async function handleRequest(req, res) {
         error: tokenJson?.error,
         error_description: tokenJson?.error_description
       });
-      sendText(res, 400, `Microsoft token exchange failed: ${JSON.stringify(tokenJson)}`);
+      sendText(res, 400, `${OAUTH_PROVIDER_LABEL} token exchange failed: ${JSON.stringify(tokenJson)}`);
       return;
     }
 

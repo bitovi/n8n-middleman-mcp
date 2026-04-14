@@ -1,5 +1,5 @@
 import * as z from 'zod/v4';
-import { MCP_USER } from '../config.js';
+import { MCP_USER, OAUTH_PROVIDER } from '../config.js';
 import { ensureUsableToken } from '../auth/oauth.js';
 import { buildWorkflowInputsWithAccessToken } from '../n8n/workflows.js';
 import { callN8nMcpTool, extractToolPayload } from '../n8n/client.js';
@@ -57,7 +57,7 @@ export function createWorkflowToolHandler(workflow, parsedDescription, hasInputH
     try {
       const userTokens = await ensureUsableToken(MCP_USER);
       if (!userTokens?.access_token) {
-        throw new Error('No valid Microsoft access token available. Re-authenticate and try again.');
+        throw new Error('No valid OAuth access token available. Re-authenticate and try again.');
       }
 
       const workflowInputs = hasInputHints
@@ -67,6 +67,7 @@ export function createWorkflowToolHandler(workflow, parsedDescription, hasInputH
       const executeInputs = buildWorkflowInputsWithAccessToken(
         workflowInputs,
         userTokens.access_token,
+        OAUTH_PROVIDER,
         workflow.triggerInfo,
         hasInputHints
       );
